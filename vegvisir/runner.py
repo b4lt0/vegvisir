@@ -4,6 +4,7 @@ import grp
 import logging
 import os
 import pathlib
+from pathlib import Path
 import queue
 import re
 import shutil
@@ -23,6 +24,129 @@ from vegvisir.hostinterface import HostInterface
 from .implementation import Endpoint, Parameters
 
 
+class QueueLogger:
+	"""
+	Host-side logger that samples qdisc/class backlog from the shaper ("sim") container
+	and writes time-series CSVs into Vegvisir's shaper log directory.
+	- Collects qdisc backlog per device at a fixed rate.
+	- Optionally collects class/tin stats if present.
+	- Captures one-time metadata snapshot.
+	Designed to be robust and self-contained (requires iproute2 inside the container).
+	"""
+	def __init__(self, host_interface, docker_compose_vars: str, service_name: str, output_dir: str, hz: float = 10.0, include_classes: bool = True, logger=None):
+		self.host_interface = host_interface
+		self.docker_compose_vars = docker_compose_vars
+		self.service_name = service_name
+		self.output_dir = output_dir
+		self.hz = hz if hz > 0 else 10.0
+		self.include_classes = include_classes
+		self.logger = logger or logging.getLogger(__name__)
+		self._stop = threading.Event()
+		self._thread = None
+		self._qdisc_fields = ["t_ns","service","device","qdisc","backlog_bytes","backlog_pkts","drops_total","overlimits_total","requeues_total","ecn_mark_total"]
+		self._class_fields = ["t_ns","service","device","classid","kind","backlog_bytes","backlog_pkts","drops_total","overlimits_total","requeues_total","ecn_mark_total"]
+
+	def _exec_in_service(self, cmd: str):
+		full = f"{self.docker_compose_vars} docker compose exec -T {self.service_name} bash -lc {json.dumps(cmd)}"
+		proc, out, err = self.host_interface.spawn_blocking_subprocess(full, False, True)
+		return getattr(proc, "returncode", 0) or 0, out or "", err or ""
+
+	def _write_meta(self):
+		try:
+			Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+			meta = {}
+			rc, out, _ = self._exec_in_service("tc -V || true"); meta["tc_version"] = out.strip()
+			rc, out, _ = self._exec_in_service("ip -j -d link || true"); meta["ip_link"] = json.loads(out) if out.strip().startswith('[') else out
+			rc, out, _ = self._exec_in_service("tc -s -j qdisc show || true"); meta["qdisc_initial"] = json.loads(out) if out.strip().startswith('[') else out
+			with open(Path(self.output_dir) / "meta_queue.json", "w") as fp:
+				json.dump(meta, fp, indent=2)
+		except Exception as e:
+			self.logger.warning(f"QueueLogger: meta snapshot failed: {e}")
+
+	def _sample_once(self, qdisc_fp, class_fp, raw_fp):
+		rc, out, _ = self._exec_in_service("tc -s -j qdisc show || true")
+		now_ns = time.monotonic_ns()
+		if rc == 0 and out.strip().startswith('['):
+			try:
+				for r in json.loads(out):
+					dev = r.get("dev", "unknown"); kind = r.get("kind", "unknown")
+					backlog = r.get("backlog", {})
+					backlog_bytes = backlog.get("bytes", backlog if isinstance(backlog, int) else 0) if isinstance(backlog, dict) or isinstance(backlog, int) else 0
+					backlog_pkts  = backlog.get("packets", r.get("qlen", 0)) if isinstance(backlog, dict) else r.get("qlen", 0)
+					row = {"t_ns": now_ns - self._t0_ns, "service": self.service_name, "device": dev, "qdisc": kind,
+						"backlog_bytes": backlog_bytes, "backlog_pkts": backlog_pkts,
+						"drops_total": r.get("drops",0), "overlimits_total": r.get("overlimits",0),
+						"requeues_total": r.get("requeues",0), "ecn_mark_total": r.get("ecn_mark",0)}
+					qdisc_fp.write(",".join(str(row[k]) for k in self._qdisc_fields) + "\n")
+				qdisc_fp.flush()
+				if raw_fp is not None: raw_fp.write(out.strip()+"\n")
+			except Exception as e:
+				self.logger.debug(f"QueueLogger: qdisc parse err: {e}")
+		if self.include_classes:
+			rc, out, _ = self._exec_in_service("tc -s -j class show || true")
+			if rc == 0 and out.strip().startswith('['):
+				try:
+					for r in json.loads(out):
+						dev = r.get("dev", "unknown"); kind = r.get("kind", "unknown"); classid = r.get("classid", r.get("handle", "n/a"))
+						backlog = r.get("backlog", {})
+						backlog_bytes = backlog.get("bytes", backlog if isinstance(backlog, int) else 0) if isinstance(backlog, dict) or isinstance(backlog, int) else 0
+						backlog_pkts  = backlog.get("packets", r.get("qlen", 0)) if isinstance(backlog, dict) else r.get("qlen", 0)
+						row = {"t_ns": now_ns - self._t0_ns, "service": self.service_name, "device": dev, "classid": classid, "kind": kind,
+							"backlog_bytes": backlog_bytes, "backlog_pkts": backlog_pkts,
+							"drops_total": r.get("drops",0), "overlimits_total": r.get("overlimits",0),
+							"requeues_total": r.get("requeues",0), "ecn_mark_total": r.get("ecn_mark",0)}
+						if class_fp: class_fp.write(",".join(str(row[k]) for k in self._class_fields) + "\n")
+					if class_fp: class_fp.flush()
+				except Exception as e:
+					self.logger.debug(f"QueueLogger: class parse err: {e}")
+
+	def start(self):
+		if getattr(self, "_thread", None):
+			return
+		Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+		self._qdisc_fp = open(Path(self.output_dir) / "queue_total.csv", "w", buffering=1); self._qdisc_fp.write(",".join(self._qdisc_fields)+"\n")
+		self._class_fp = open(Path(self.output_dir) / "queue_classes.csv", "w", buffering=1) if self.include_classes else None
+		if self._class_fp: self._class_fp.write(",".join(self._class_fields)+"\n")
+		self._raw_fp   = open(Path(self.output_dir) / "queue_raw.ndjson", "w", buffering=1)
+		# Wait up to 30s until the service is ready
+		deadline = time.time() + 30.0
+		while time.time() < deadline:
+			rc, out, _ = self._exec_in_service("tc -s -j qdisc show || true")
+			if rc == 0 and len(out.strip()) > 0:
+				break
+			time.sleep(0.5)
+		self._write_meta()
+		self._t0_ns = time.monotonic_ns()
+		self._thread = threading.Thread(target=self._run, name="QueueLogger", daemon=True); self._thread.start()
+		self.logger.info(f"QueueLogger started at {self.hz} Hz → {self.output_dir}")
+
+	def _run(self):
+		period = 1.0/self.hz
+		try:
+			while not getattr(self, "_stop", threading.Event()).is_set():
+				self._sample_once(self._qdisc_fp, self._class_fp, self._raw_fp)
+				time.sleep(period)
+		except Exception as e:
+			self.logger.warning(f"QueueLogger loop exception: {e}")
+		finally:
+			try: self._qdisc_fp.close()
+			except Exception: pass
+			try: 
+				if self._class_fp: self._class_fp.close()
+			except Exception: pass
+			try: self._raw_fp.close()
+			except Exception: pass
+
+	def stop(self):
+		try:
+			self._stop.set()
+			if getattr(self, "_thread", None): self._thread.join(timeout=5.0)
+			self._thread = None
+			self.logger.info("QueueLogger stopped")
+		except Exception as e:
+			self.logger.warning(f"QueueLogger stop exception: {e}")
+
+
 class LogFileFormatter(logging.Formatter):
 	def format(self, record):
 		msg = super(LogFileFormatter, self).format(record)
@@ -32,6 +156,7 @@ class LogFileFormatter(logging.Formatter):
 class Experiment:
 	def __init__(self, sudo_password: str, configuration_object: Configuration):
 		self.configuration = configuration_object
+		self._queue_logger = None
 
 		self.post_hook_processors: List[threading.Thread] = []
 		self.post_hook_processor_request_stop: bool = False
@@ -297,6 +422,22 @@ class Experiment:
 						# self.host_interface.spawn_parallel_subprocess(cmd, False, True)
 						_, out, err = self.host_interface.spawn_blocking_subprocess(cmd, False, True) # TODO Test out if this truly fixes the RNETLINK error? This call might be too slow
 
+						# Start QueueLogger in the shaper ("sim") container
+						try:
+							shaper_logs_dir = self.configuration.path_collection.log_path_shaper
+							self._queue_logger = QueueLogger(
+								host_interface=self.host_interface,
+								docker_compose_vars=docker_compose_vars,
+								service_name="sim",
+								output_dir=shaper_logs_dir,
+								hz=10.0,
+								include_classes=True,
+								logger=self.logger
+							)
+							self._queue_logger.start()
+						except Exception as _ql_ex:
+							self.logger.warning(f"QueueLogger failed to start: {_ql_ex}")
+
 						self.logger.debug(f"Started sim and server | STDOUT [{out}] | STDERR [{chr(10) if err.find(chr(10)) >= 0 else ''}{err}{chr(10) if err.find(chr(10)) >= 0 else ''}]") # chr(10) => '\n'
 						
 						# Host applications require some packet rerouting to be able to reach docker containers
@@ -538,6 +679,14 @@ class Experiment:
 						_, out, err = self.host_interface.spawn_blocking_subprocess(docker_compose_vars + " docker compose logs --timestamps tcpdump_rightnet", False, True)
 						self.logger.debug(out)
 						self.logger.debug(err)
+						# Stop QueueLogger before tearing down the stack
+						try:
+							if self._queue_logger is not None:
+								self._queue_logger.stop()
+								self._queue_logger = None
+						except Exception as _ql_stop_ex:
+							self.logger.warning(f"QueueLogger failed to stop cleanly: {_ql_stop_ex}")
+
 
 						_, out ,err = self.host_interface.spawn_blocking_subprocess(docker_compose_vars + " docker compose down", False, True) # TODO TEMP
 						self.logger.debug(out)
