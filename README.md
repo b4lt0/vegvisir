@@ -547,6 +547,91 @@ We use the same method of creating images as used in the [QUIC Interop Runner pr
 
 Take a look at our [tc-netem](/docker-images/tc-netem/run.sh) shaper image if you want to create your own shaper image. It provides a good example of how to create a shaper by applying configurations on the `eth0` and `eth1` network interfaces provided to these containers.
 
+# Multi-flow (tc-netem): shared bottleneck & staggered flows
+Vegvisir can run multiple client flows that share the same bottleneck queue with staggered starts and optional per-flow netem (e.g., extra latency, loss). Use this for congestion-control studies where flows must mix in a single queue.
+How it works (tl;dr):
+The runner launches N client containers (one per flow), honoring each flow’s start_ms.
+The tc-netem shaper scenario multi-flows creates one shared HTB+netem bottleneck per direction and applies per-flow delay on IFBs, so flows contend in the same queue.
+The runner passes a generated manifest (FLOWS_PATH) to the shaper.
+Add to implementations.json:
+```
+{
+  "shapers": {
+    "tc-netem": {
+      "image": "tc-netem",
+      "scenarios": {
+        "simple": {
+          "command": "simple !{LATENCY} !{THROUGHPUT}",
+          "parameters": ["THROUGHPUT", "LATENCY"]
+        },
+        "multi-flows": {
+          "command": "multi_flows !{FLOWS_PATH} !{LATENCY} !{THROUGHPUT}",
+          "parameters": ["FLOWS_PATH", "LATENCY", "THROUGHPUT"]
+        }
+      }
+    }
+  }
+}
+```
+Add to experiment.json:
+```
+{
+  "clients": [
+    {
+      "name": "quic-dc",
+      "arguments": { "CONGESTION": "westwood" },
+      "multi": {
+        "flows": [
+          {
+            "label": "f1",
+            "start_ms": 0,
+            "netem": { "extra_latency_ms": 10, "loss_pct": 0 },
+            "arguments": { "REQUESTS": "/largefile" }
+          },
+          {
+            "label": "f2",
+            "start_ms": 100,
+            "netem": { "extra_latency_ms": 20, "loss_pct": 0 },
+            "arguments": { "REQUESTS": "/largefile" }
+          },
+          {
+            "label": "f3",
+            "start_ms": 200,
+            "netem": { "extra_latency_ms": 30, "loss_pct": 0 },
+            "arguments": { "REQUESTS": "/largefile" }
+          }
+        ]
+      }
+    }
+  ],
+
+  "servers": [
+    { "name": "quic-dc", "arguments": { "CONGESTION": "westwood" } }
+  ],
+
+  "shapers": [
+    {
+      "name": "tc-netem",
+      "scenario": "multi-flows",
+      "arguments": { "THROUGHPUT": "100", "LATENCY": "50" }
+    }
+  ],
+
+  "environment": { "name": "webserver-basic",
+    "sensors": [{ "name": "timeout", "timeout": 60 }]
+  },
+
+  "settings": { "label": "quic-dc_100M_50ms", "iterations": 1 }
+}
+```
+Run:
+```
+python -m vegvisir run -i implementations.json experiment.json
+```
+Notes:
+FLOWS_PATH is auto-populated by the runner; you don’t set it manually.
+You can put REQUESTS at the client level or override per-flow (as shown).
+
 # Frequently Asked Questions
 ## Why do I need to enter my sudo password?!
 Vegvisir requires root privileges to change system specifics such as routes to assure the experiments run correctly. Additionally, you can use privileged calls in your experiment setups.
