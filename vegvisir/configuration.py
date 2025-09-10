@@ -220,11 +220,13 @@ class Configuration:
 		except FileNotFoundError as e:
 			raise VegvisirConfigurationException(f"Implementations file [{experiment_path}] not found | {e}")
 		except json.JSONDecodeError as e:
-			raise VegvisirInvalidExperimentConfigurationException(f"Failed to decode experiment configuration JSON [{experiment_path}] | {e}")
-
+			raise VegvisirInvalidExperimentConfigurationException(f"Failed to decode experiment configuration JSON [{experiment_path}] | {e}")  
+			
+		
 	def _load_and_validate_experiment_from_dict(self, configuration: Dict) -> None:
 		"""
 		Load and validate is a bad smell, but then again why bother :)
+		(Extended to validate optional 'multi' block on clients for multi-flow runs.)
 		"""
 		if not self._implementations_configuration_loaded:
 			raise VegvisirConfigurationException("Configuration objects can not load experiment configurations without implementations being loaded first.")
@@ -296,16 +298,106 @@ class Configuration:
 					cmd.serialize_command(hydrated_parameters)
 			except VegvisirArgumentException as e:
 				raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_endpoint.name}] contains a command [{cmd.command}] that fails to serialize: {e}")
-		
+
+		# ---- NEW: multi-flow validation (optional) ---------------------------------
+		def _validate_multi_block(client_cfg: Dict, client_endpoint: Endpoint) -> None:
+			multi = client_cfg.get("multi")
+			if multi is None:
+				return
+			if type(multi) is not dict:
+				raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] 'multi' must be a dictionary.")
+
+			flows = multi.get("flows")
+			if type(flows) is not list or len(flows) == 0:
+				raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] 'multi.flows' must be a non-empty list.")
+
+			seen_labels = set()
+			base_args_keys = set(client_cfg.get("arguments", {}).keys()) if type(client_cfg.get("arguments")) is dict else set()
+
+			for idx, flow in enumerate(flows):
+				if type(flow) is not dict:
+					raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] flow #{idx} must be a dictionary.")
+				# label
+				label = flow.get("label")
+				if type(label) is not str or label.strip() == "":
+					raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] flow #{idx} missing or invalid 'label'.")
+				if label in seen_labels:
+					raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] duplicate flow label '{label}'.")
+				seen_labels.add(label)
+				# start_ms
+				start_ms = flow.get("start_ms", 0)
+				if not (isinstance(start_ms, int) and start_ms >= 0):
+					raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] flow '{label}' has invalid 'start_ms' (must be integer ≥ 0).")
+				# netem (optional)
+				netem = flow.get("netem", {})
+				if netem is not None and type(netem) is not dict:
+					raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] flow '{label}' 'netem' must be a dictionary when provided.")
+				if type(netem) is dict:
+					if "extra_latency_ms" in netem:
+						extra_latency_ms = netem["extra_latency_ms"]
+						if not (isinstance(extra_latency_ms, int) and extra_latency_ms >= 0):
+							raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] flow '{label}' 'netem.extra_latency_ms' must be integer ≥ 0.")
+					if "loss_pct" in netem:
+						loss_pct = netem["loss_pct"]
+						if not (isinstance(loss_pct, (int, float)) and 0 <= loss_pct <= 100):
+							raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] flow '{label}' 'netem.loss_pct' must be between 0 and 100.")
+
+				# arguments (flow-level override/extend)
+				flow_args = flow.get("arguments", {})
+				if flow_args is not None and type(flow_args) is not dict:
+					raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] flow '{label}' 'arguments' must be a dictionary when provided.")
+
+				# Effective args = top-level client args (if any) overridden by flow args
+				effective_keys = set(base_args_keys)
+				if type(flow_args) is dict:
+					effective_keys |= set(flow_args.keys())
+
+				# Validate required/unknown parameters against the client implementation
+				valid_input, missing_required_parameters, invalid_parameters = client_endpoint.parameters.can_input_fit_arguments(list(effective_keys))
+				if not valid_input:
+					# Prefer a clear error mentioning the flow label
+					if len(invalid_parameters) > 0:
+						raise VegvisirInvalidExperimentConfigurationException(
+							f"Client [{client_cfg['name']}] flow '{label}' has unknown argument keys {invalid_parameters} | missing required {missing_required_parameters}"
+						)
+					raise VegvisirInvalidExperimentConfigurationException(
+						f"Client [{client_cfg['name']}] flow '{label}' is missing required parameters {missing_required_parameters}"
+					)
+
+			# Optional extras at 'multi' level (validated lightly here)
+			stop_condition = multi.get("stop_condition")
+			if stop_condition is not None and stop_condition not in ("all_exit", "any_exit"):
+				raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] 'multi.stop_condition' must be 'all_exit' or 'any_exit' if provided.")
+			max_duration_s = multi.get("max_duration_s")
+			if max_duration_s is not None:
+				if not (isinstance(max_duration_s, int) and max_duration_s > 0):
+					raise VegvisirInvalidExperimentConfigurationException(f"Client [{client_cfg['name']}] 'multi.max_duration_s' must be an integer > 0 if provided.")
+		# ---------------------------------------------------------------------------
+
+		# Clients
 		duplicate_check = set()
 		for index, client in enumerate(configuration[CLIENTS_KEY]):
 			_namecheck_dict(client, index, "client", self._client_endpoints)
 			_duplicate_check(client["name"], client.get("log_name"), duplicate_check, "client")
 			duplicate_check.add(client["log_name"] if client.get("log_name") is not None else client["name"])
-			_parametercheck_endpoint(self._client_endpoints[client["name"]], client, "client")
-			_validate_command_with_real_parameters(self._client_endpoints[client["name"]], client.get("arguments", {}))
+
+			client_endpoint = self._client_endpoints[client["name"]]
+
+			# Multi-aware validation:
+			if client.get("multi") is not None:
+				# Validate the multi block and per-flow effective arguments
+				_validate_multi_block(client, client_endpoint)
+				# We deliberately DO NOT enforce top-level 'arguments' here, since each flow may provide them.
+				# (Back-compat behavior for non-multi clients remains unchanged.)
+				_validate_command_with_real_parameters(client_endpoint, client.get("arguments", {}))  # host-type only
+			else:
+				# Original single-flow behavior
+				_parametercheck_endpoint(client_endpoint, client, "client")
+				_validate_command_with_real_parameters(client_endpoint, client.get("arguments", {}))  # host-type only
+
 			self._client_configurations.append(client)
 
+		# Servers
 		duplicate_check = set()
 		for index, server in enumerate(configuration[SERVERS_KEY]):
 			_namecheck_dict(server, index, "server", self._server_endpoints)
@@ -314,6 +406,7 @@ class Configuration:
 			_parametercheck_endpoint(self._server_endpoints[server["name"]], server, "server")
 			self._server_configurations.append(server)
 
+		# Shapers
 		duplicate_check = set()
 		for index, shaper in enumerate(configuration[SHAPERS_KEY]):
 			_namecheck_dict(shaper, index, "shaper", self._shapers)
@@ -322,12 +415,14 @@ class Configuration:
 			_scenariocheck_shaper(shaper, self._shapers[shaper["name"]].scenarios)
 			self._shaper_configurations.append(shaper)
 
+		# Paths / labels
 		if settings.get("log_dir") is not None:
 			log_dir_root = os.path.abspath(os.path.join(settings["log_dir"], "{}/"))
 		else:
 			log_dir_root = os.path.abspath("logs/{}/")
 		self._path_collection.log_path_root = log_dir_root.format(settings.get("label", "_unidentified"))
 
+		# WWW path
 		if settings.get("www_dir") is not None:
 			self._www_path = os.path.abspath(settings["www_dir"])
 		else:
@@ -335,6 +430,7 @@ class Configuration:
 		if not os.path.exists(self._www_path):
 			raise VegvisirInvalidExperimentConfigurationException(f"WWW path does not exist [{self._www_path}]")
 
+		# Iterations
 		iterations = settings.get("iterations", 1)
 		if type(iterations) is str and not iterations.isdigit():
 			raise VegvisirInvalidExperimentConfigurationException("Setting 'iterations' must be > 0.")
@@ -345,6 +441,7 @@ class Configuration:
 		if self._iterations <= 0:
 			raise VegvisirInvalidExperimentConfigurationException("Setting 'iterations' must be > 0.")
 
+		# Hook processors
 		hook_processors = settings.get("hook_processors", 4)
 		if type(hook_processors) is str and not hook_processors.isdigit():
 			raise VegvisirInvalidExperimentConfigurationException("Setting 'hook_processors' must be > 0.")
@@ -355,6 +452,7 @@ class Configuration:
 		if self.hook_processor_count <= 0:
 			raise VegvisirInvalidExperimentConfigurationException("Setting 'hook_processors' must be > 0.")
 
+		# Environment + sensors
 		environment = configuration.get("environment")
 		if environment is None:
 			raise VegvisirInvalidExperimentConfigurationException("No 'environment' key was found.")

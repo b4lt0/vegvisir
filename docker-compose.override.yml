@@ -1,0 +1,34 @@
+services:
+  client_f1:
+    extends:
+      file: ./docker-compose.yml
+      service: client
+    container_name: client_f1
+    env_file:
+      - client_f1.env
+    networks:
+      leftnet:
+        ipv4_address: "193.167.0.3"
+        ipv6_address: "fd00:cafe:cafe:0::3"
+  client_f2:
+    extends:
+      file: ./docker-compose.yml
+      service: client
+    container_name: client_f2
+    env_file:
+      - client_f2.env
+    networks:
+      leftnet:
+        ipv4_address: "193.167.0.4"
+        ipv6_address: "fd00:cafe:cafe:0::4"
+  client_f3:
+    extends:
+      file: ./docker-compose.yml
+      service: client
+    container_name: client_f3
+    env_file:
+      - client_f3.env
+    networks:
+      leftnet:
+        ipv4_address: "193.167.0.5"
+        ipv6_address: "fd00:cafe:cafe:0::5"

@@ -1,5 +1,4 @@
-version: "3.5"
-
+#version: "3.5"
 services:
   sim:
     image: $SHAPER
@@ -115,7 +114,7 @@ services:
     environment:
       - ROLE=server
       - CLIENT=client4
-      - IPERF_CONGESTION=$IPERF_CONGESTION
+      - IPERF_CONGESTION=${IPERF_CONGESTION:-cubic}
     depends_on:
       - sim
     cap_add: 
@@ -137,7 +136,7 @@ services:
     tty: true
     environment:
       - ROLE=client
-      - IPERF_CONGESTION=$IPERF_CONGESTION
+      - IPERF_CONGESTION=${IPERF_CONGESTION:-cubic}
     depends_on:
       - sim
     cap_add: 

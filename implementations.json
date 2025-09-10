@@ -1,0 +1,46 @@
+{
+    "clients": {
+      "quic-dc": {
+        "image": "b4lt00/quic-dc:latest",
+        "parameters": {
+          "REQUESTS": true,
+          "CONGESTION": true
+        }
+      }
+    },
+  
+    "servers": {
+      "quic-dc": {
+        "image": "b4lt00/quic-dc:latest",
+        "parameters": {
+          "CONGESTION": true
+        }
+      }
+    },
+  
+    "shapers": {
+      "tc-netem": {
+        "image": "tc-netem",
+        "scenarios": {
+          "simple": {
+            "command": "simple !{LATENCY} !{THROUGHPUT}",
+            "parameters": ["THROUGHPUT", "LATENCY"]
+          },
+          "multi_flows": {
+            "command": "multi_flows !{FLOWS_PATH} !{LATENCY} !{THROUGHPUT}",
+            "parameters": ["FLOWS_PATH", "LATENCY", "THROUGHPUT"]
+          },
+          "cellular-loss-good": "\"akamai_cellular_emulation.sh loss_based good\"",
+          "cellular-loss-median": "\"akamai_cellular_emulation.sh loss_based median\"",
+          "cellular-loss-poor": "\"akamai_cellular_emulation.sh loss_based poor\"",
+          "cellular-experience-noloss": "\"akamai_cellular_emulation.sh experience_based noloss\"",
+          "cellular-experience-good": "\"akamai_cellular_emulation.sh experience_based good\"",
+          "cellular-experience-fair": "\"akamai_cellular_emulation.sh experience_based fair\"",
+          "cellular-experience-passable": "\"akamai_cellular_emulation.sh experience_based passable\"",
+          "cellular-experience-poor": "\"akamai_cellular_emulation.sh experience_based poor\"",
+          "cellular-experience-verypoor": "\"akamai_cellular_emulation.sh experience_based verypoor\""
+        }
+      }
+    }
+  }
+  

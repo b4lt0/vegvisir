@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# multi_flows (debug + IPv6-safe): shared bottleneck per dir + per-flow extras (flower)
+# Args: $1=FLOWS_PATH (JSON), $2=LATENCY(ms, one-way), $3=THROUGHPUT(Mbit per dir)
+
+mkdir -p /logs || true
+exec > >(tee -a /logs/multi_flows.debug) 2>&1
+# set -x
+
+# echo "[multi_flows] tc version:"; tc -V || true
+# echo "[multi_flows] kernel:"; uname -a || true
+
+die() { echo "multi_flows: $*" >&2; exit 1; }
+require() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+tcx() {
+  # echo "[multi_flows] RUN: tc $*"
+  set +e; tc "$@"; local rc=$?; set -e
+  if [ $rc -ne 0 ]; then echo "[multi_flows] ERROR(rc=$rc): tc $*"; exit $rc; fi
+}
+
+[[ $# -ge 3 ]] || die "usage: multi_flows FLOWS_PATH LATENCY(ms) THROUGHPUT(Mbit)"
+FLOWS_PATH="$1"; BASE_LAT="$2"; RATE="$3"
+
+require tc; require ip; require getent; require awk; require jq
+[[ -f "$FLOWS_PATH" ]] || die "flows manifest not found at $FLOWS_PATH"
+
+SERVER_CONT="$(jq -r '.server_container // empty' "$FLOWS_PATH")"
+[[ -n "$SERVER_CONT" ]] || die "server_container missing in manifest"
+FLOW_COUNT="$(jq '.flows | length' "$FLOWS_PATH")"
+[[ "$FLOW_COUNT" -gt 0 ]] || die "no flows in manifest"
+
+resolve_ip() {
+  local name="$1" ip=""
+  for _ in $(seq 1 60); do
+    ip="$(getent hosts "$name" | awk '{print $1}' | head -n1 || true)"
+    [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+    sleep 0.2
+  done
+  return 1
+}
+resolve_both_ips() {
+  local name="$1" ip4="" ip6="" line
+  while read -r line; do
+    set -- $line
+    if [[ "$1" == *:* ]]; then [[ -z "$ip6" ]] && ip6="$1"; else [[ -z "$ip4" ]] && ip4="$1"; fi
+  done < <(getent ahosts "$name" || true)
+  if [[ -z "$ip4" && -z "$ip6" ]]; then
+    while read -r a _; do
+      if [[ "$a" == *:* ]]; then [[ -z "$ip6" ]] && ip6="$a"; else [[ -z "$ip4" ]] && ip4="$a"; fi
+    done < <(getent hosts "$name" || true)
+  fi
+  echo "${ip4:-} ${ip6:-}"
+}
+route_dev() {
+  local ip="$1"
+  if [[ "$ip" == *:* ]]; then
+    ip -6 -o route get "$ip" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+  else
+    ip -4 -o route get "$ip" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+  fi
+}
+
+SERVER_IP="$(resolve_ip "$SERVER_CONT")" || die "failed to resolve IP for $SERVER_CONT"
+FIRST_CLIENT_CONT="$(jq -r '.flows[0].container' "$FLOWS_PATH")"
+FIRST_CLIENT_IP="$(resolve_ip "$FIRST_CLIENT_CONT")" || die "failed to resolve IP for $FIRST_CLIENT_CONT"
+DEV_TO_SERVER="$(route_dev "$SERVER_IP")"
+DEV_TO_CLIENTS="$(route_dev "$FIRST_CLIENT_IP")"
+[[ -n "$DEV_TO_SERVER" && -n "$DEV_TO_CLIENTS" ]] || die "failed to detect shaper interfaces"
+
+echo "[multi_flows] server=$SERVER_CONT ip=$SERVER_IP dev=$DEV_TO_SERVER | clients dev=$DEV_TO_CLIENTS"
+echo "[multi_flows] base latency=${BASE_LAT}ms rate=${RATE}Mbit flows=$FLOW_COUNT"
+
+cleanup() {
+  set +e
+  tc qdisc del dev "$DEV_TO_SERVER" root 2>/dev/null
+  tc qdisc del dev "$DEV_TO_CLIENTS" root 2>/dev/null
+  tc qdisc del dev "$DEV_TO_SERVER" ingress 2>/dev/null
+  tc qdisc del dev "$DEV_TO_CLIENTS" ingress 2>/dev/null
+  tc qdisc del dev ifb0 root 2>/dev/null
+  tc qdisc del dev ifb1 root 2>/dev/null
+  ip link del ifb0 2>/dev/null
+  ip link del ifb1 2>/dev/null
+}
+trap cleanup INT TERM EXIT
+
+# IFBs + ingress mirroring (IPv4 & IPv6)
+modprobe ifb >/dev/null 2>&1 || true
+tcx qdisc replace dev "$DEV_TO_CLIENTS" ingress
+tcx qdisc replace dev "$DEV_TO_SERVER"  ingress
+ip link add ifb0 type ifb 2>/dev/null || true
+ip link add ifb1 type ifb 2>/dev/null || true
+ip link set ifb0 up; ip link set ifb1 up
+
+tcx filter add dev "$DEV_TO_CLIENTS" parent ffff: protocol ip   u32 match u32 0 0 action mirred egress redirect dev ifb0 || \
+tcx filter replace dev "$DEV_TO_CLIENTS" parent ffff: protocol ip   u32 match u32 0 0 action mirred egress redirect dev ifb0
+tcx filter add dev "$DEV_TO_CLIENTS" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev ifb0 || \
+tcx filter replace dev "$DEV_TO_CLIENTS" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev ifb0
+
+tcx filter add dev "$DEV_TO_SERVER"  parent ffff: protocol ip   u32 match u32 0 0 action mirred egress redirect dev ifb1 || \
+tcx filter replace dev "$DEV_TO_SERVER"  parent ffff: protocol ip   u32 match u32 0 0 action mirred egress redirect dev ifb1
+tcx filter add dev "$DEV_TO_SERVER"  parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev ifb1 || \
+tcx filter replace dev "$DEV_TO_SERVER"  parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev ifb1
+
+# Shared bottlenecks (one per direction)
+tcx qdisc replace dev "$DEV_TO_SERVER" root handle 1: htb default 1
+tcx class  replace dev "$DEV_TO_SERVER" parent 1: classid 1:1 htb rate "${RATE}"mbit ceil "${RATE}"mbit
+tcx qdisc  replace dev "$DEV_TO_SERVER" parent 1:1 handle 10: netem delay "${BASE_LAT}"ms
+
+tcx qdisc replace dev "$DEV_TO_CLIENTS" root handle 3: htb default 1
+tcx class  replace dev "$DEV_TO_CLIENTS" parent 3: classid 3:1 htb rate "${RATE}"mbit ceil "${RATE}"mbit
+tcx qdisc  replace dev "$DEV_TO_CLIENTS" parent 3:1 handle 30: netem delay "${BASE_LAT}"ms
+
+# IFB roots: prio with N bands
+N="$FLOW_COUNT"
+tcx qdisc replace dev ifb0 root handle 11: prio bands "$N"
+tcx qdisc replace dev ifb1 root handle 21: prio bands "$N"
+
+i=1
+while [[ $i -le $N ]]; do
+  CONT="$(jq -r ".flows[$((i-1))].container" "$FLOWS_PATH")"
+  EXTRA_DELAY="$(jq -r ".flows[$((i-1))].extra_delay_ms // .flows[$((i-1))].extra_latency_ms // 0" "$FLOWS_PATH")"
+  LOSS_PCT="$(jq -r ".flows[$((i-1))].loss_pct // empty" "$FLOWS_PATH")"
+
+  UL_NETEM_OPTS=""
+  [[ -n "$EXTRA_DELAY" && "$EXTRA_DELAY" -gt 0 ]] && UL_NETEM_OPTS+=" delay ${EXTRA_DELAY}ms"
+  [[ -n "$LOSS_PCT" ]] && UL_NETEM_OPTS+=" loss ${LOSS_PCT}%"
+
+  tcx qdisc replace dev ifb0 parent 11:$i handle $((i))0:  netem $UL_NETEM_OPTS
+  tcx qdisc replace dev ifb1 parent 21:$i handle 2$((i))0: netem $UL_NETEM_OPTS
+
+  CIP4=""; CIP6=""
+  read -r CIP4 CIP6 <<< "$(resolve_both_ips "$CONT")"
+  echo "[multi_flows] flow#$i container=$CONT ip4=${CIP4:-NA} ip6=${CIP6:-NA} extras: ${UL_NETEM_OPTS:-none}"
+
+  # Use unique priorities per flow/family to avoid any collision
+  P4_UL=$((100 + i)); P6_UL=$((200 + i))
+  P4_DL=$((300 + i)); P6_DL=$((400 + i))
+
+  # UPLINK classification (client -> server): src_ip
+  if [[ -n "${CIP4}" ]]; then
+    tcx filter add dev ifb0 parent 11: protocol ip   prio ${P4_UL} flower src_ip "${CIP4}"/32  flowid 11:$i || \
+    tcx filter replace dev ifb0 parent 11: protocol ip   prio ${P4_UL} flower src_ip "${CIP4}"/32  flowid 11:$i
+  fi
+  if [[ -n "${CIP6}" ]]; then
+    tcx filter add dev ifb0 parent 11: protocol ipv6 prio ${P6_UL} flower src_ip "${CIP6}"/128 flowid 11:$i || \
+    tcx filter replace dev ifb0 parent 11: protocol ipv6 prio ${P6_UL} flower src_ip "${CIP6}"/128 flowid 11:$i
+  fi
+
+  # DOWNLINK classification (server -> client): dst_ip
+  if [[ -n "${CIP4}" ]]; then
+    tcx filter add dev ifb1 parent 21: protocol ip   prio ${P4_DL} flower dst_ip "${CIP4}"/32  flowid 21:$i || \
+    tcx filter replace dev ifb1 parent 21: protocol ip   prio ${P4_DL} flower dst_ip "${CIP4}"/32  flowid 21:$i
+  fi
+  if [[ -n "${CIP6}" ]]; then
+    tcx filter add dev ifb1 parent 21: protocol ipv6 prio ${P6_DL} flower dst_ip "${CIP6}"/128 flowid 21:$i || \
+    tcx filter replace dev ifb1 parent 21: protocol ipv6 prio ${P6_DL} flower dst_ip "${CIP6}"/128 flowid 21:$i
+  fi
+
+  i=$((i+1))
+done
+
+# Audit
+cp -f "$FLOWS_PATH" /logs/flows.json 2>/dev/null || true
+ip addr show               > /logs/ip_addr.txt
+ip route show              > /logs/ip_route.txt
+tc -s qdisc show dev "$DEV_TO_SERVER"   > /logs/tc_egress_server.txt
+tc -s qdisc show dev "$DEV_TO_CLIENTS"  > /logs/tc_egress_clients.txt
+tc -s qdisc show dev ifb0               > /logs/tc_ifb0_qdisc.txt
+tc -s filter show dev ifb0 parent 11:   > /logs/tc_ifb0_filters.txt
+tc -s qdisc show dev ifb1               > /logs/tc_ifb1_qdisc.txt
+tc -s filter show dev ifb1 parent 21:   > /logs/tc_ifb1_filters.txt
+
+echo "[multi_flows] ready: shared bottlenecks on $DEV_TO_SERVER/$DEV_TO_CLIENTS; per-flow extras on ifb0/ifb1."
+while sleep 3600; do :; done

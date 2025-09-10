@@ -20,7 +20,7 @@ fi
 
 
 echo "Activating sync mechanism with netcat"
-netcat -l 57832
+netcat -lk 57832 >/dev/null 2>&1 &
 echo "Netcat done"
 
 echo "Using scenario:" $SCENARIO
