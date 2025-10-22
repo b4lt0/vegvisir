@@ -2,25 +2,25 @@
     "clients": [
         {
             "name": "quic-dc",
-            "arguments": { "CONGESTION": "westwood" }, 
+            "arguments": { "CONGESTION": "westwood_owd" }, 
             "multi": {
               "flows": [
                 {
                   "label": "f1",
-                  "start_ms": 0,
+                  "start_ms": 10,
                   "netem": { "extra_latency_ms": 10, "loss_pct": 0},
                   "arguments": { "REQUESTS": "/largefile" }
                 },
                 {
                   "label": "f2",
-                  "start_ms": 100,
+                  "start_ms": 20,
                   "netem": { "extra_latency_ms": 20, "loss_pct": 0 },
                   "arguments": { "REQUESTS": "/largefile" }
                 }
                 ,
                 {
                   "label": "f3",
-                  "start_ms": 200,
+                  "start_ms": 30,
                   "netem": { "extra_latency_ms": 30, "loss_pct": 0 },
                   "arguments": { "REQUESTS": "/largefile" }
                 }
@@ -33,7 +33,7 @@
       {
         "name": "quic-dc",
         "arguments": {
-          "CONGESTION": "westwood"
+          "CONGESTION": "westwood_owd"
         }
       }
     ],
@@ -45,7 +45,8 @@
         "arguments": {
           "THROUGHPUT": "100",
           "LATENCY": "50",
-          "FLOWS_PATH": "/logs/flows.json"
+          "FLOWS_PATH": "/logs/flows.json",
+          "BDP": "2"
         }
       }
     ],

@@ -14,14 +14,20 @@ import time
 from datetime import datetime
 from typing import List
 import json
-
 from vegvisir.configuration import Configuration
 from vegvisir.data import VegvisirArguments
 from vegvisir.environments.base_environment import BaseEnvironment
 from vegvisir.exceptions import VegvisirException, VegvisirRunFailedException
-from vegvisir.hostinterface import HostInterface
+from vegvisir.hostinterface import HostInterface 
 
 from .implementation import Endpoint, Parameters
+
+try:
+	from visual.netan.process_runs import RunProcessor
+	from visual.netan.report_generator import ReportGenerator
+except Exception:
+    RunProcessor = None
+    ReportGenerator = None
 
 
 class QueueLogger:
@@ -64,41 +70,115 @@ class QueueLogger:
 			self.logger.warning(f"QueueLogger: meta snapshot failed: {e}")
 
 	def _sample_once(self, qdisc_fp, class_fp, raw_fp):
+		now_ns = time.time_ns() 
+
 		rc, out, _ = self._exec_in_service("tc -s -j qdisc show || true")
-		now_ns = time.monotonic_ns()
-		if rc == 0 and out.strip().startswith('['):
+		s = (out or "").strip()
+		if rc == 0 and s:
 			try:
-				for r in json.loads(out):
-					dev = r.get("dev", "unknown"); kind = r.get("kind", "unknown")
+				payload = json.loads(s)
+				if isinstance(payload, list):
+					items = payload
+				elif isinstance(payload, dict):
+					items = payload.get("qdisc", [payload])
+				else:
+					items = []
+				for r in items:
+					if not isinstance(r, dict):
+						continue
+					dev  = r.get("dev") or r.get("ifname") or "unknown"
+					kind = r.get("kind", "unknown")
 					backlog = r.get("backlog", {})
-					backlog_bytes = backlog.get("bytes", backlog if isinstance(backlog, int) else 0) if isinstance(backlog, dict) or isinstance(backlog, int) else 0
-					backlog_pkts  = backlog.get("packets", r.get("qlen", 0)) if isinstance(backlog, dict) else r.get("qlen", 0)
-					row = {"t_ns": now_ns - self._t0_ns, "service": self.service_name, "device": dev, "qdisc": kind,
-						"backlog_bytes": backlog_bytes, "backlog_pkts": backlog_pkts,
-						"drops_total": r.get("drops",0), "overlimits_total": r.get("overlimits",0),
-						"requeues_total": r.get("requeues",0), "ecn_mark_total": r.get("ecn_mark",0)}
+
+					# SAFE parse for dict / int / "1234b 7p"
+					if isinstance(backlog, dict):
+						backlog_bytes = int(backlog.get("bytes") or 0)
+						backlog_pkts  = int(backlog.get("packets") or r.get("qlen", 0) or 0)
+					elif isinstance(backlog, int):
+						backlog_bytes = int(backlog)
+						backlog_pkts  = int(r.get("qlen", 0) or 0)
+					elif isinstance(backlog, str):
+						m = re.search(r"(\d+)b\s+(\d+)p", backlog)
+						backlog_bytes = int(m.group(1)) if m else 0
+						backlog_pkts  = int(m.group(2)) if m else int(r.get("qlen", 0) or 0)
+					else:
+						backlog_bytes = 0
+						backlog_pkts  = int(r.get("qlen", 0) or 0)
+
+					row = {
+						"t_ns": now_ns,
+						"service": self.service_name,
+						"device": dev,
+						"qdisc": kind,
+						"backlog_bytes": backlog_bytes,
+						"backlog_pkts": backlog_pkts,
+						"drops_total": int(r.get("drops", 0) or 0),
+						"overlimits_total": int(r.get("overlimits", 0) or 0),
+						"requeues_total": int(r.get("requeues", 0) or 0),
+						"ecn_mark_total": int(r.get("ecn_mark", 0) or 0),
+					}
 					qdisc_fp.write(",".join(str(row[k]) for k in self._qdisc_fields) + "\n")
 				qdisc_fp.flush()
-				if raw_fp is not None: raw_fp.write(out.strip()+"\n")
+				if raw_fp is not None:
+					raw_fp.write(s + "\n")
 			except Exception as e:
 				self.logger.debug(f"QueueLogger: qdisc parse err: {e}")
+
+		
 		if self.include_classes:
 			rc, out, _ = self._exec_in_service("tc -s -j class show || true")
-			if rc == 0 and out.strip().startswith('['):
+			s = (out or "").strip()
+			if rc == 0 and s:
 				try:
-					for r in json.loads(out):
-						dev = r.get("dev", "unknown"); kind = r.get("kind", "unknown"); classid = r.get("classid", r.get("handle", "n/a"))
+					payload = json.loads(s)
+					if isinstance(payload, list):
+						items = payload
+					elif isinstance(payload, dict):
+						items = payload.get("class", [payload])
+					else:
+						items = []
+					for r in items:
+						if not isinstance(r, dict):
+							continue
+						dev  = r.get("dev") or r.get("ifname") or "unknown"
+						kind = r.get("kind", "unknown")
+						classid = r.get("classid", r.get("handle", "n/a"))
 						backlog = r.get("backlog", {})
-						backlog_bytes = backlog.get("bytes", backlog if isinstance(backlog, int) else 0) if isinstance(backlog, dict) or isinstance(backlog, int) else 0
-						backlog_pkts  = backlog.get("packets", r.get("qlen", 0)) if isinstance(backlog, dict) else r.get("qlen", 0)
-						row = {"t_ns": now_ns - self._t0_ns, "service": self.service_name, "device": dev, "classid": classid, "kind": kind,
-							"backlog_bytes": backlog_bytes, "backlog_pkts": backlog_pkts,
-							"drops_total": r.get("drops",0), "overlimits_total": r.get("overlimits",0),
-							"requeues_total": r.get("requeues",0), "ecn_mark_total": r.get("ecn_mark",0)}
-						if class_fp: class_fp.write(",".join(str(row[k]) for k in self._class_fields) + "\n")
-					if class_fp: class_fp.flush()
+
+						if isinstance(backlog, dict):
+							backlog_bytes = int(backlog.get("bytes") or 0)
+							backlog_pkts  = int(backlog.get("packets") or r.get("qlen", 0) or 0)
+						elif isinstance(backlog, int):
+							backlog_bytes = int(backlog)
+							backlog_pkts  = int(r.get("qlen", 0) or 0)
+						elif isinstance(backlog, str):
+							m = re.search(r"(\d+)b\s+(\d+)p", backlog)
+							backlog_bytes = int(m.group(1)) if m else 0
+							backlog_pkts  = int(m.group(2)) if m else int(r.get("qlen", 0) or 0)
+						else:
+							backlog_bytes = 0
+							backlog_pkts  = int(r.get("qlen", 0) or 0)
+
+						row = {
+							"t_ns": now_ns,
+							"service": self.service_name,
+							"device": dev,
+							"classid": classid,
+							"kind": kind,
+							"backlog_bytes": backlog_bytes,
+							"backlog_pkts": backlog_pkts,
+							"drops_total": int(r.get("drops", 0) or 0),
+							"overlimits_total": int(r.get("overlimits", 0) or 0),
+							"requeues_total": int(r.get("requeues", 0) or 0),
+							"ecn_mark_total": int(r.get("ecn_mark", 0) or 0),
+						}
+						if class_fp:
+							class_fp.write(",".join(str(row[k]) for k in self._class_fields) + "\n")
+					if class_fp:
+						class_fp.flush()
 				except Exception as e:
 					self.logger.debug(f"QueueLogger: class parse err: {e}")
+
 
 	def start(self):
 		if getattr(self, "_thread", None):
@@ -160,7 +240,7 @@ class Experiment:
 
 		self.post_hook_processors: List[threading.Thread] = []
 		self.post_hook_processor_request_stop: bool = False
-		self.post_hook_processor_queue: queue.Queue = queue.Queue()  # contains tuples (method pointer, path dataclass)
+		self.post_hook_processor_queue: queue.Queue = queue.Queue()
 
 		self.host_interface = HostInterface(sudo_password)
 
@@ -180,6 +260,74 @@ class Experiment:
 					self.logger.error(f"Post-hook encountered an exception | {e}")
 			except queue.Empty:
 				pass  # We can ignore this one
+
+	def _generate_report_task(self, experiment_paths):
+		"""
+		Post-hook task: build a per-connection report into <connection-root>/report/.
+		Inputs (per your spec):
+			- qlogs: server/qlog/*.qlog    (N files = N flows)
+			- owd:   server/qlog/*.owd     (exactly one)
+			- queue: shaper/                (directory; expects queue_total.csv)
+		Uses defaults: device=eth0, qdisc=netem.
+		Never raises: logs and returns on error.
+		"""
+		# If netan isn't importable, don't break anything:
+		if RunProcessor is None or ReportGenerator is None:
+			self.logger.warning("Report generation skipped: netan not available in this environment.")
+			return
+		else:
+			self.logger.warning("Report generation OK: netan available in this environment.")
+
+		try:
+			conn_root = experiment_paths.log_path_permutation  # vegvisir/logs/.../<client__shaper__server>/
+			server_qlog_dir = os.path.join(experiment_paths.log_path_server, "qlog")
+			queue_dir = experiment_paths.log_path_shaper
+
+			# Collect inputs
+			qlog_paths = sorted([
+				os.path.join(server_qlog_dir, p)
+				for p in os.listdir(server_qlog_dir)
+				if p.endswith(".qlog")
+			]) if os.path.isdir(server_qlog_dir) else []
+
+			owd_paths = sorted([
+				os.path.join(server_qlog_dir, p)
+				for p in os.listdir(server_qlog_dir)
+				if p.endswith(".owd")
+			]) if os.path.isdir(server_qlog_dir) else []
+
+			if not qlog_paths:
+				self.logger.warning(f"[report] No server qlogs found under {server_qlog_dir}; skipping report.")
+				return
+			if not owd_paths:
+				self.logger.warning(f"[report] No *.owd file found under {server_qlog_dir}; skipping report.")
+				return
+
+			owd_file = owd_paths[0]  # you said there's a single *.owd; if more, take the first deterministically
+
+			# Build the run
+			rp = RunProcessor(queue_run_dir=queue_dir, device="eth0", qdisc="netem")
+			for q in qlog_paths:
+				rp.add_qlog(q)
+			rp.set_owd_file(owd_file)
+
+			run_output = rp.run()
+
+			# Output folder: <connection-root>/report
+			out_dir = Path(os.path.join(conn_root, "report"))
+			out_dir.mkdir(parents=True, exist_ok=True)
+
+			rg = ReportGenerator(run_output, out_dir, show_p50=True, show_p90=True, showfliers=False)
+			csv_path = rg.generate()
+
+			# Also emit a compact text summary for quick eyeballing
+			with open(out_dir / "report.txt", "w") as fp:
+				rg.print_report(stream=fp)
+
+			self.logger.info(f"[report] Generated: {out_dir} (CSV at {csv_path})")
+		except Exception as e:
+			# Absolutely never crash the run due to reporting
+			self.logger.warning(f"[report] Failed to generate report for {getattr(experiment_paths, 'log_path_permutation', '?')}: {e}", exc_info=True)
 
 
 	def _enable_ipv6(self):
@@ -358,7 +506,7 @@ class Experiment:
 						# BEGIN multi-flow manifest emission (flows.json) and FLOWS_PATH injection
 						try:
 							is_multi = isinstance(client_config.get("multi"), dict) and isinstance(client_config["multi"].get("flows"), list) and len(client_config["multi"]["flows"]) > 0
-							is_multi_flows_scenario = (shaper_config.get("scenario") == "multi_flows")
+							is_multi_flows_scenario = shaper_config.get("scenario", "").startswith("multi_flows")
 							if is_multi and is_multi_flows_scenario:
 								flows = []
 								for flow in client_config["multi"]["flows"]:
@@ -430,7 +578,7 @@ class Experiment:
 								docker_compose_vars=docker_compose_vars,
 								service_name="sim",
 								output_dir=shaper_logs_dir,
-								hz=10.0,
+								hz=1000.0,
 								include_classes=True,
 								logger=self.logger
 							)
@@ -723,6 +871,7 @@ class Experiment:
 						self.logger.warning(f"Could not change log output ownership [{e}] @ {self.configuration.path_collection.log_path_permutation}")
 
 					self.post_hook_processor_queue.put((self.configuration.environment.post_run_hook, path_collection_copy))  # Queue is infinite, should not block
+					self.post_hook_processor_queue.put((self._generate_report_task, path_collection_copy))
 
 					experiment_permutation_counter += 1
 

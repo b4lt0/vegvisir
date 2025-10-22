@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# multi_flows (debug + IPv6-safe): shared bottleneck per dir + per-flow extras (flower)
-# Args: $1=FLOWS_PATH (JSON), $2=LATENCY(ms, one-way), $3=THROUGHPUT(Mbit per dir)
+# multi_flows: shared bottleneck per dir + per-flow extras (flower)
+# Args: $1=FLOWS_PATH (JSON), $2=LATENCY(ms, one-way), $3=THROUGHPUT(Mbit per dir), $4=BDP_MULTIPLIER
 
 mkdir -p /logs || true
 exec > >(tee -a /logs/multi_flows.debug) 2>&1
@@ -19,8 +19,8 @@ tcx() {
   if [ $rc -ne 0 ]; then echo "[multi_flows] ERROR(rc=$rc): tc $*"; exit $rc; fi
 }
 
-[[ $# -ge 3 ]] || die "usage: multi_flows FLOWS_PATH LATENCY(ms) THROUGHPUT(Mbit)"
-FLOWS_PATH="$1"; BASE_LAT="$2"; RATE="$3"
+[[ $# -ge 4 ]] || die "usage: multi_flows FLOWS_PATH LATENCY(ms) THROUGHPUT(Mbit) BDP_MULTIPLIER"
+FLOWS_PATH="$1"; BASE_LAT="$2"; RATE="$3"; BDP_MULTIPLIER="$4"
 
 require tc; require ip; require getent; require awk; require jq
 [[ -f "$FLOWS_PATH" ]] || die "flows manifest not found at $FLOWS_PATH"
@@ -29,6 +29,11 @@ SERVER_CONT="$(jq -r '.server_container // empty' "$FLOWS_PATH")"
 [[ -n "$SERVER_CONT" ]] || die "server_container missing in manifest"
 FLOW_COUNT="$(jq '.flows | length' "$FLOWS_PATH")"
 [[ "$FLOW_COUNT" -gt 0 ]] || die "no flows in manifest"
+
+# Calculate buffer size: BDP_multiplier × RATE × BASE_LAT × 2 
+# RATE is in Mbit/s, BASE_LAT is in ms (one-way), RTT = 2×BASE_LAT
+# BDP (bytes) = (RATE × 10^6 / 8) × (RTT / 1000) = RATE × BASE_LAT × 2
+BUFFER_SIZE=$((BDP_MULTIPLIER * RATE * BASE_LAT * 250 ))
 
 resolve_ip() {
   local name="$1" ip=""
@@ -70,6 +75,7 @@ DEV_TO_CLIENTS="$(route_dev "$FIRST_CLIENT_IP")"
 
 echo "[multi_flows] server=$SERVER_CONT ip=$SERVER_IP dev=$DEV_TO_SERVER | clients dev=$DEV_TO_CLIENTS"
 echo "[multi_flows] base latency=${BASE_LAT}ms rate=${RATE}Mbit flows=$FLOW_COUNT"
+echo "[multi_flows] BDP multiplier=${BDP_MULTIPLIER} → buffer size=${BUFFER_SIZE} bytes"
 
 cleanup() {
   set +e
@@ -102,14 +108,17 @@ tcx filter replace dev "$DEV_TO_SERVER"  parent ffff: protocol ip   u32 match u3
 tcx filter add dev "$DEV_TO_SERVER"  parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev ifb1 || \
 tcx filter replace dev "$DEV_TO_SERVER"  parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev ifb1
 
-# Shared bottlenecks (one per direction)
+# Shared bottlenecks (one per direction) with BDP-based buffer limiting
+# Structure: HTB (rate limit) → bfifo (queue/buffer) → netem (delay)
 tcx qdisc replace dev "$DEV_TO_SERVER" root handle 1: htb default 1
-tcx class  replace dev "$DEV_TO_SERVER" parent 1: classid 1:1 htb rate "${RATE}"mbit ceil "${RATE}"mbit
+tcx class  replace dev "$DEV_TO_SERVER" parent 1: classid 1:1 htb rate "${RATE}"mbit ceil "${RATE}"mbit burst 65535
 tcx qdisc  replace dev "$DEV_TO_SERVER" parent 1:1 handle 10: netem delay "${BASE_LAT}"ms
+tcx qdisc  replace dev "$DEV_TO_SERVER" parent 10:1 handle 100: bfifo limit "${BUFFER_SIZE}"
 
 tcx qdisc replace dev "$DEV_TO_CLIENTS" root handle 3: htb default 1
-tcx class  replace dev "$DEV_TO_CLIENTS" parent 3: classid 3:1 htb rate "${RATE}"mbit ceil "${RATE}"mbit
+tcx class  replace dev "$DEV_TO_CLIENTS" parent 3: classid 3:1 htb rate "${RATE}"mbit ceil "${RATE}"mbit burst 65535
 tcx qdisc  replace dev "$DEV_TO_CLIENTS" parent 3:1 handle 30: netem delay "${BASE_LAT}"ms
+tcx qdisc  replace dev "$DEV_TO_CLIENTS" parent 30:1 handle 300: bfifo limit "${BUFFER_SIZE}"
 
 # IFB roots: prio with N bands
 N="$FLOW_COUNT"
