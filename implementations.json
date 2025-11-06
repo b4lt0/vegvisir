@@ -27,9 +27,15 @@
             "parameters": ["THROUGHPUT", "LATENCY"]
           },
           "multi_flows": {
-            "command": "multi_flows !{FLOWS_PATH} !{LATENCY} !{THROUGHPUT}",
-            "parameters": ["FLOWS_PATH", "LATENCY", "THROUGHPUT"]
+            "command": "multi_flows !{FLOWS_PATH} !{LATENCY} !{THROUGHPUT} !{BDP}",
+            "parameters": ["FLOWS_PATH", "LATENCY", "THROUGHPUT", "BDP"]
           },
+
+          "multi_flows_akamai": {
+            "command": "multi_flows_akamai !{FLOWS_PATH} !{MODE}",
+            "parameters": ["FLOWS_PATH", "MODE"]
+          },
+
           "cellular-loss-good": "\"akamai_cellular_emulation.sh loss_based good\"",
           "cellular-loss-median": "\"akamai_cellular_emulation.sh loss_based median\"",
           "cellular-loss-poor": "\"akamai_cellular_emulation.sh loss_based poor\"",

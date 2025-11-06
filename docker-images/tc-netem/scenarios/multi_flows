@@ -19,7 +19,7 @@ tcx() {
   if [ $rc -ne 0 ]; then echo "[multi_flows] ERROR(rc=$rc): tc $*"; exit $rc; fi
 }
 
-[[ $# -ge 4 ]] || die "usage: multi_flows FLOWS_PATH LATENCY(ms) THROUGHPUT(Mbit) BDP_MULTIPLIER"
+[[ $# -ge 4 ]] || die "usage: multi_flows FLOWS_PATH LATENCY(ms) THROUGHPUT(Mbit) BDP"
 FLOWS_PATH="$1"; BASE_LAT="$2"; RATE="$3"; BDP_MULTIPLIER="$4"
 
 require tc; require ip; require getent; require awk; require jq
