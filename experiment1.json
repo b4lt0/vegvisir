@@ -1,0 +1,111 @@
+{
+    "clients": [
+        {
+            "name": "quic-dc",
+            "arguments": { "CONGESTION": "westwood_owd" }, 
+            "multi": {
+              "flows": [
+                {
+                  "label": "f1",
+                  "start_ms": 10,
+                  "netem": { "extra_latency_ms": 5, "loss_pct": 0},
+                  "arguments": { "REQUESTS": "/largefile" }
+                },
+                {
+                  "label": "f2",
+                  "start_ms": 20,
+                  "netem": { "extra_latency_ms": 10, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+                ,
+                {
+                  "label": "f3",
+                  "start_ms": 30,
+                  "netem": { "extra_latency_ms": 15, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+                ,
+                {
+                  "label": "f4",
+                  "start_ms": 40,
+                  "netem": { "extra_latency_ms": 20, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+                ,
+                {
+                  "label": "f5",
+                  "start_ms": 50,
+                  "netem": { "extra_latency_ms": 25, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+                ,
+                {
+                  "label": "f6",
+                  "start_ms": 60,
+                  "netem": { "extra_latency_ms": 30, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+                ,
+                {
+                  "label": "f7",
+                  "start_ms": 70,
+                  "netem": { "extra_latency_ms": 35, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+                ,
+                {
+                  "label": "f8",
+                  "start_ms": 80,
+                  "netem": { "extra_latency_ms": 40, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+                ,
+                {
+                  "label": "f9",
+                  "start_ms": 90,
+                  "netem": { "extra_latency_ms": 45, "loss_pct": 0 },
+                  "arguments": { "REQUESTS": "/largefile" }
+                }
+              ]
+            }
+          }
+    ],
+  
+    "servers": [
+      {
+        "name": "quic-dc",
+        "arguments": {
+          "CONGESTION": "westwood_owd"
+        }
+      }
+    ],
+  
+    "shapers": [
+      {
+        "name": "tc-netem",
+        "scenario": "multi_flows",
+        "arguments": {
+          "THROUGHPUT": "100",
+          "LATENCY": "50",
+          "FLOWS_PATH": "/logs/flows.json",
+          "BDP": "2"
+        }
+      }
+    ],
+  
+    "environment": {
+      "name": "webserver-basic",
+      "sensors": [
+        {
+          "name": "timeout",
+          "timeout": 300
+        }
+      ]
+    },
+  
+    "settings": {
+      "label": "quic-dc_9flows_100M_50ms_stag10_exdel10-50",
+      "iterations": 1
+    }
+  }
+  
